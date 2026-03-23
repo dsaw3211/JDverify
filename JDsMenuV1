@@ -1,0 +1,2202 @@
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+local GuiService = game:GetService("GuiService")
+local TweenService = game:GetService("TweenService")
+
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+local Camera = Workspace.CurrentCamera
+
+local ACCESS_CODE = "XYw2@VzJD"
+
+local uiOpen = true
+local unlocked = false
+local highlightEnabled = false
+local nametagEnabled = true
+local teamCheckEnabled = true
+local zombieLockEnabled = false
+local flyEnabled = false
+
+local currentZombieTarget = nil
+local zombieLockConnection = nil
+local waitingForKeybind = nil
+local activeTab = "Visuals"
+local tabAnimating = false
+local speedEnforceConnection = nil
+
+local flyRenderConnection = nil
+local flyBodyVelocity = nil
+local flyCurrentVelocity = Vector3.zero
+local flyControls = {
+	Forward = false,
+	Backward = false,
+	Left = false,
+	Right = false,
+	Up = false,
+	Down = false,
+}
+
+local LOCK_RADIUS = 140
+local TARGET_SCAN_INTERVAL = 0.08
+local lastTargetScan = 0
+
+local currentWalkSpeed = 16
+local MIN_SPEED = 10
+local MAX_SPEED = 75
+
+local currentFlySpeed = 65
+local MIN_FLY_SPEED = 20
+local MAX_FLY_SPEED = 150
+
+local FLY_SMOOTHNESS = 10
+local FLY_FORCE = Vector3.new(1e8, 1e8, 1e8)
+
+local Keybinds = {
+	ToggleUI = Enum.KeyCode.T,
+	DestroyUI = Enum.KeyCode.X,
+	FreeMouse = Enum.KeyCode.L,
+	ZombieLock = Enum.KeyCode.Z,
+	Highlight = Enum.KeyCode.H,
+	NameTags = Enum.KeyCode.N,
+	TeamCheck = Enum.KeyCode.J,
+	Fly = Enum.KeyCode.F,
+}
+
+local modelCache = {}
+
+local updateStatusText
+local updateDynamicTexts
+local applyVisualsFilter
+
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "CleanAdminUI"
+screenGui.ResetOnSpawn = false
+screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Global
+screenGui.DisplayOrder = 99999999
+screenGui.IgnoreGuiInset = false
+screenGui.Parent = PlayerGui
+
+local function keyCodeToText(keyCode)
+	if not keyCode then
+		return "NONE"
+	end
+	return keyCode.Name
+end
+
+local function applyZIndex(_, mapping)
+	for _, pair in ipairs(mapping) do
+		local obj = pair[1]
+		local z = pair[2]
+		if obj and obj:IsA("GuiObject") then
+			obj.ZIndex = z
+		end
+	end
+end
+
+local function setDescendantZIndex(root, z)
+	if root and root:IsA("GuiObject") then
+		root.ZIndex = z
+	end
+
+	for _, desc in ipairs(root:GetDescendants()) do
+		if desc:IsA("GuiObject") then
+			desc.ZIndex = z
+		end
+	end
+end
+
+local function getMouseScreenPosition()
+	local inset = GuiService:GetGuiInset()
+	local mousePos = UserInputService:GetMouseLocation()
+	return Vector2.new(mousePos.X - inset.X, mousePos.Y - inset.Y)
+end
+
+local function getCharacterModelFromDescendant(desc)
+	local current = desc
+	while current and current ~= Workspace do
+		if current:IsA("Model") and current:FindFirstChildOfClass("Humanoid") then
+			return current
+		end
+		current = current.Parent
+	end
+	return nil
+end
+
+local function addModelToCache(model)
+	if model and model:IsA("Model") then
+		modelCache[model] = true
+	end
+end
+
+local function removeModelFromCache(model)
+	if model then
+		modelCache[model] = nil
+	end
+end
+
+local function rebuildModelCache()
+	table.clear(modelCache)
+
+	for _, desc in ipairs(Workspace:GetDescendants()) do
+		if desc:IsA("Humanoid") then
+			local model = getCharacterModelFromDescendant(desc)
+			if model then
+				addModelToCache(model)
+			end
+		elseif desc:IsA("Model") and desc:FindFirstChildOfClass("Humanoid") then
+			addModelToCache(desc)
+		end
+	end
+end
+
+local function getLocalHumanoid()
+	local character = LocalPlayer.Character
+	if not character then
+		return nil
+	end
+	return character:FindFirstChildOfClass("Humanoid")
+end
+
+local function getLocalRootPart()
+	local character = LocalPlayer.Character
+	if not character then
+		return nil
+	end
+	return character:FindFirstChild("HumanoidRootPart")
+end
+
+local function clampWalkSpeed(value)
+	return math.clamp(math.floor(value + 0.5), MIN_SPEED, MAX_SPEED)
+end
+
+local function clampFlySpeed(value)
+	return math.clamp(math.floor(value + 0.5), MIN_FLY_SPEED, MAX_FLY_SPEED)
+end
+
+local function applyWalkSpeed()
+	local humanoid = getLocalHumanoid()
+	if humanoid then
+		humanoid.WalkSpeed = currentWalkSpeed
+	end
+end
+
+local function stopSpeedEnforcement()
+	if speedEnforceConnection then
+		speedEnforceConnection:Disconnect()
+		speedEnforceConnection = nil
+	end
+end
+
+local function startSpeedEnforcement()
+	stopSpeedEnforcement()
+
+	speedEnforceConnection = RunService.RenderStepped:Connect(function()
+		if not unlocked then
+			return
+		end
+
+		local humanoid = getLocalHumanoid()
+		if humanoid and humanoid.Health > 0 and humanoid.WalkSpeed ~= currentWalkSpeed then
+			humanoid.WalkSpeed = currentWalkSpeed
+		end
+	end)
+end
+
+local function clearFlyMovement()
+	for key in pairs(flyControls) do
+		flyControls[key] = false
+	end
+end
+
+local function destroyFlyObjects()
+	if flyRenderConnection then
+		flyRenderConnection:Disconnect()
+		flyRenderConnection = nil
+	end
+
+	if flyBodyVelocity then
+		flyBodyVelocity:Destroy()
+		flyBodyVelocity = nil
+	end
+
+	local root = getLocalRootPart()
+	if root then
+		root.AssemblyLinearVelocity = Vector3.zero
+	end
+
+	flyCurrentVelocity = Vector3.zero
+	clearFlyMovement()
+end
+
+local function getFlyMoveDirection()
+	local forwardAxis = (flyControls.Forward and 1 or 0) - (flyControls.Backward and 1 or 0)
+	local rightAxis = (flyControls.Right and 1 or 0) - (flyControls.Left and 1 or 0)
+	local verticalAxis = (flyControls.Up and 1 or 0) - (flyControls.Down and 1 or 0)
+
+	local lookVector = Camera.CFrame.LookVector
+	local rightVector = Camera.CFrame.RightVector
+
+	local flatLook = Vector3.new(lookVector.X, 0, lookVector.Z)
+	local flatRight = Vector3.new(rightVector.X, 0, rightVector.Z)
+
+	if flatLook.Magnitude > 0 then
+		flatLook = flatLook.Unit
+	end
+
+	if flatRight.Magnitude > 0 then
+		flatRight = flatRight.Unit
+	end
+
+	local moveDirection = (flatLook * forwardAxis) + (flatRight * rightAxis) + Vector3.new(0, verticalAxis, 0)
+
+	if moveDirection.Magnitude > 1 then
+		moveDirection = moveDirection.Unit
+	end
+
+	return moveDirection
+end
+
+local function startFlyController()
+	destroyFlyObjects()
+
+	local character = LocalPlayer.Character
+	local humanoid = getLocalHumanoid()
+	local root = getLocalRootPart()
+
+	if not character or not humanoid or humanoid.Health <= 0 or not root then
+		return
+	end
+
+	local existing = root:FindFirstChild("AdminFlyVelocity")
+	if existing and existing:IsA("BodyVelocity") then
+		flyBodyVelocity = existing
+	else
+		flyBodyVelocity = Instance.new("BodyVelocity")
+		flyBodyVelocity.Name = "AdminFlyVelocity"
+		flyBodyVelocity.MaxForce = FLY_FORCE
+		flyBodyVelocity.P = 15000
+		flyBodyVelocity.Velocity = Vector3.zero
+		flyBodyVelocity.Parent = root
+	end
+
+	humanoid:ChangeState(Enum.HumanoidStateType.Freefall)
+	flyCurrentVelocity = Vector3.zero
+
+	flyRenderConnection = RunService.RenderStepped:Connect(function(deltaTime)
+		if not flyEnabled then
+			return
+		end
+
+		local currentCharacter = LocalPlayer.Character
+		local currentHumanoid = getLocalHumanoid()
+		local currentRoot = getLocalRootPart()
+
+		if not currentCharacter or not currentHumanoid or currentHumanoid.Health <= 0 or not currentRoot then
+			destroyFlyObjects()
+			return
+		end
+
+		if not flyBodyVelocity or flyBodyVelocity.Parent ~= currentRoot then
+			destroyFlyObjects()
+			if flyEnabled then
+				startFlyController()
+			end
+			return
+		end
+
+		local desiredDirection = getFlyMoveDirection()
+		local desiredVelocity = desiredDirection * currentFlySpeed
+		local lerpAlpha = math.clamp(deltaTime * FLY_SMOOTHNESS, 0, 1)
+
+		flyCurrentVelocity = flyCurrentVelocity:Lerp(desiredVelocity, lerpAlpha)
+		flyBodyVelocity.Velocity = flyCurrentVelocity
+		currentHumanoid:ChangeState(Enum.HumanoidStateType.Freefall)
+	end)
+end
+
+local function stopFlyController()
+	destroyFlyObjects()
+
+	local humanoid = getLocalHumanoid()
+	if humanoid and humanoid.Health > 0 then
+		humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
+	end
+end
+
+local function setFlyEnabled(enabled)
+	if flyEnabled == enabled then
+		return
+	end
+
+	flyEnabled = enabled
+
+	if flyEnabled then
+		startFlyController()
+	else
+		stopFlyController()
+	end
+
+	if updateDynamicTexts then
+		updateDynamicTexts()
+	end
+	if updateStatusText then
+		updateStatusText()
+	end
+end
+
+local function toggleFly()
+	setFlyEnabled(not flyEnabled)
+end
+
+rebuildModelCache()
+
+Workspace.DescendantAdded:Connect(function(desc)
+	if desc:IsA("Humanoid") then
+		local model = getCharacterModelFromDescendant(desc)
+		if model then
+			addModelToCache(model)
+		end
+	elseif desc:IsA("Model") and desc:FindFirstChildOfClass("Humanoid") then
+		addModelToCache(desc)
+	end
+end)
+
+Workspace.DescendantRemoving:Connect(function(desc)
+	if desc:IsA("Model") then
+		removeModelFromCache(desc)
+		if currentZombieTarget == desc then
+			currentZombieTarget = nil
+		end
+	elseif desc:IsA("Humanoid") then
+		local model = getCharacterModelFromDescendant(desc)
+		if model then
+			removeModelFromCache(model)
+			if currentZombieTarget == model then
+				currentZombieTarget = nil
+			end
+		end
+	end
+end)
+
+-- LOGIN UI
+local loginFrame = Instance.new("Frame")
+loginFrame.Name = "LoginFrame"
+loginFrame.Size = UDim2.new(0, 420, 0, 220)
+loginFrame.Position = UDim2.new(0.5, -210, 0.5, -110)
+loginFrame.BackgroundColor3 = Color3.fromRGB(7, 7, 14)
+loginFrame.BorderSizePixel = 1
+loginFrame.BorderColor3 = Color3.fromRGB(35, 35, 60)
+loginFrame.Parent = screenGui
+
+local loginTop = Instance.new("Frame")
+loginTop.Size = UDim2.new(1, 0, 0, 34)
+loginTop.BackgroundColor3 = Color3.fromRGB(10, 10, 10)
+loginTop.BorderSizePixel = 0
+loginTop.Parent = loginFrame
+
+local loginTitle = Instance.new("TextLabel")
+loginTitle.BackgroundTransparency = 1
+loginTitle.Position = UDim2.new(0, 12, 0, 0)
+loginTitle.Size = UDim2.new(1, -24, 1, 0)
+loginTitle.Font = Enum.Font.Code
+loginTitle.Text = "Enter Access Code"
+loginTitle.TextSize = 20
+loginTitle.TextColor3 = Color3.fromRGB(255, 255, 255)
+loginTitle.TextXAlignment = Enum.TextXAlignment.Left
+loginTitle.Parent = loginTop
+
+local loginInfo = Instance.new("TextLabel")
+loginInfo.BackgroundTransparency = 1
+loginInfo.Position = UDim2.new(0, 16, 0, 52)
+loginInfo.Size = UDim2.new(1, -32, 0, 44)
+loginInfo.Font = Enum.Font.Code
+loginInfo.Text = "Enter the code to open the debug UI."
+loginInfo.TextWrapped = true
+loginInfo.TextSize = 16
+loginInfo.TextColor3 = Color3.fromRGB(180, 180, 200)
+loginInfo.TextXAlignment = Enum.TextXAlignment.Left
+loginInfo.TextYAlignment = Enum.TextYAlignment.Top
+loginInfo.Parent = loginFrame
+
+local codeBox = Instance.new("TextBox")
+codeBox.Size = UDim2.new(1, -32, 0, 40)
+codeBox.Position = UDim2.new(0, 16, 0, 108)
+codeBox.BackgroundColor3 = Color3.fromRGB(8, 8, 18)
+codeBox.BorderSizePixel = 1
+codeBox.BorderColor3 = Color3.fromRGB(35, 35, 70)
+codeBox.Font = Enum.Font.Code
+codeBox.PlaceholderText = "Enter code..."
+codeBox.Text = ""
+codeBox.TextSize = 18
+codeBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+codeBox.PlaceholderColor3 = Color3.fromRGB(130, 130, 150)
+codeBox.ClearTextOnFocus = false
+codeBox.Parent = loginFrame
+
+local codePad = Instance.new("UIPadding")
+codePad.PaddingLeft = UDim.new(0, 10)
+codePad.PaddingRight = UDim.new(0, 10)
+codePad.Parent = codeBox
+
+local statusLabel = Instance.new("TextLabel")
+statusLabel.BackgroundTransparency = 1
+statusLabel.Position = UDim2.new(0, 16, 0, 154)
+statusLabel.Size = UDim2.new(1, -32, 0, 20)
+statusLabel.Font = Enum.Font.Code
+statusLabel.Text = ""
+statusLabel.TextSize = 15
+statusLabel.TextColor3 = Color3.fromRGB(255, 120, 120)
+statusLabel.TextXAlignment = Enum.TextXAlignment.Left
+statusLabel.Parent = loginFrame
+
+local submitButton = Instance.new("TextButton")
+submitButton.Size = UDim2.new(0, 120, 0, 34)
+submitButton.Position = UDim2.new(1, -136, 1, -50)
+submitButton.BackgroundColor3 = Color3.fromRGB(8, 8, 18)
+submitButton.BorderSizePixel = 1
+submitButton.BorderColor3 = Color3.fromRGB(35, 35, 70)
+submitButton.Font = Enum.Font.Code
+submitButton.Text = "Unlock"
+submitButton.TextSize = 18
+submitButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+submitButton.Parent = loginFrame
+
+-- MAIN UI
+local main = Instance.new("Frame")
+main.Name = "Main"
+main.Size = UDim2.new(0, 760, 0, 460)
+main.Position = UDim2.new(0.5, -380, 0.5, -230)
+main.BackgroundColor3 = Color3.fromRGB(7, 7, 14)
+main.BorderSizePixel = 1
+main.BorderColor3 = Color3.fromRGB(35, 35, 60)
+main.Visible = false
+main.Parent = screenGui
+
+local topBar = Instance.new("Frame")
+topBar.Name = "TopBar"
+topBar.Size = UDim2.new(1, 0, 0, 34)
+topBar.BackgroundColor3 = Color3.fromRGB(10, 10, 10)
+topBar.BorderSizePixel = 0
+topBar.Parent = main
+
+local title = Instance.new("TextLabel")
+title.BackgroundTransparency = 1
+title.Position = UDim2.new(0, 14, 0, 0)
+title.Size = UDim2.new(1, -140, 1, 0)
+title.Font = Enum.Font.Code
+title.Text = "Admin / Debug Tools"
+title.TextSize = 20
+title.TextColor3 = Color3.fromRGB(255, 255, 255)
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Parent = topBar
+
+local topHint = Instance.new("TextLabel")
+topHint.BackgroundTransparency = 1
+topHint.AnchorPoint = Vector2.new(1, 0.5)
+topHint.Position = UDim2.new(1, -40, 0.5, 0)
+topHint.Size = UDim2.new(0, 360, 0, 22)
+topHint.Font = Enum.Font.Code
+topHint.TextSize = 14
+topHint.TextColor3 = Color3.fromRGB(160, 160, 180)
+topHint.TextXAlignment = Enum.TextXAlignment.Right
+topHint.Parent = topBar
+
+local tabsBar = Instance.new("Frame")
+tabsBar.Name = "TabsBar"
+tabsBar.Size = UDim2.new(1, 0, 0, 28)
+tabsBar.Position = UDim2.new(0, 0, 0, 34)
+tabsBar.BackgroundColor3 = Color3.fromRGB(6, 6, 10)
+tabsBar.BorderSizePixel = 0
+tabsBar.Parent = main
+
+local tabVisuals = Instance.new("TextButton")
+tabVisuals.Size = UDim2.new(0, 110, 1, 0)
+tabVisuals.Position = UDim2.new(0, 8, 0, 0)
+tabVisuals.BackgroundColor3 = Color3.fromRGB(8, 8, 18)
+tabVisuals.BorderSizePixel = 0
+tabVisuals.Font = Enum.Font.Code
+tabVisuals.Text = "Visuals"
+tabVisuals.TextSize = 18
+tabVisuals.TextColor3 = Color3.fromRGB(190, 255, 120)
+tabVisuals.Parent = tabsBar
+
+local tabSettings = Instance.new("TextButton")
+tabSettings.Size = UDim2.new(0, 110, 1, 0)
+tabSettings.Position = UDim2.new(0, 126, 0, 0)
+tabSettings.BackgroundColor3 = Color3.fromRGB(8, 8, 18)
+tabSettings.BorderSizePixel = 0
+tabSettings.Font = Enum.Font.Code
+tabSettings.Text = "Settings"
+tabSettings.TextSize = 18
+tabSettings.TextColor3 = Color3.fromRGB(200, 200, 200)
+tabSettings.Parent = tabsBar
+
+local content = Instance.new("Frame")
+content.Name = "Content"
+content.Size = UDim2.new(1, -20, 1, -110)
+content.Position = UDim2.new(0, 10, 0, 72)
+content.BackgroundColor3 = Color3.fromRGB(3, 3, 12)
+content.BorderSizePixel = 1
+content.BorderColor3 = Color3.fromRGB(25, 25, 55)
+content.ClipsDescendants = true
+content.Parent = main
+
+local visualsPage = Instance.new("ScrollingFrame")
+visualsPage.Name = "VisualsPage"
+visualsPage.Size = UDim2.new(1, 0, 1, 0)
+visualsPage.Position = UDim2.new(0, 0, 0, 0)
+visualsPage.BackgroundTransparency = 1
+visualsPage.BorderSizePixel = 0
+visualsPage.ScrollBarThickness = 8
+visualsPage.ScrollBarImageColor3 = Color3.fromRGB(180, 255, 120)
+visualsPage.CanvasSize = UDim2.new(0, 0, 0, 0)
+visualsPage.AutomaticCanvasSize = Enum.AutomaticSize.None
+visualsPage.ScrollingDirection = Enum.ScrollingDirection.Y
+visualsPage.Parent = content
+
+local visualsPad = Instance.new("UIPadding")
+visualsPad.PaddingTop = UDim.new(0, 10)
+visualsPad.PaddingBottom = UDim.new(0, 10)
+visualsPad.PaddingLeft = UDim.new(0, 10)
+visualsPad.PaddingRight = UDim.new(0, 10)
+visualsPad.Parent = visualsPage
+
+local visualsList = Instance.new("UIListLayout")
+visualsList.FillDirection = Enum.FillDirection.Vertical
+visualsList.SortOrder = Enum.SortOrder.LayoutOrder
+visualsList.Padding = UDim.new(0, 10)
+visualsList.Parent = visualsPage
+
+local settingsPage = Instance.new("Frame")
+settingsPage.Name = "SettingsPage"
+settingsPage.Size = UDim2.new(1, 0, 1, 0)
+settingsPage.Position = UDim2.new(1, 0, 0, 0)
+settingsPage.BackgroundTransparency = 1
+settingsPage.Visible = true
+settingsPage.Parent = content
+
+local footer = Instance.new("Frame")
+footer.Name = "Footer"
+footer.Size = UDim2.new(1, 0, 0, 28)
+footer.Position = UDim2.new(0, 0, 1, -28)
+footer.BackgroundColor3 = Color3.fromRGB(10, 10, 10)
+footer.BorderSizePixel = 0
+footer.Parent = main
+
+local footerText = Instance.new("TextLabel")
+footerText.BackgroundTransparency = 1
+footerText.Size = UDim2.new(1, -20, 1, 0)
+footerText.Position = UDim2.new(0, 10, 0, 0)
+footerText.Font = Enum.Font.Code
+footerText.TextSize = 15
+footerText.TextColor3 = Color3.fromRGB(150, 150, 180)
+footerText.TextXAlignment = Enum.TextXAlignment.Left
+footerText.Parent = footer
+
+local credits = Instance.new("TextLabel")
+credits.Name = "Credits"
+credits.BackgroundTransparency = 1
+credits.AnchorPoint = Vector2.new(1, 1)
+credits.Position = UDim2.new(1, -10, 1, -36)
+credits.Size = UDim2.new(0, 220, 0, 20)
+credits.Font = Enum.Font.Code
+credits.Text = "made by ChatGPT for debug use"
+credits.TextSize = 14
+credits.TextColor3 = Color3.fromRGB(120, 120, 145)
+credits.TextXAlignment = Enum.TextXAlignment.Right
+credits.Parent = main
+
+local closeButton = Instance.new("TextButton")
+closeButton.Name = "CloseButton"
+closeButton.Size = UDim2.new(0, 28, 0, 24)
+closeButton.AnchorPoint = Vector2.new(1, 0.5)
+closeButton.Position = UDim2.new(1, -8, 0.5, 0)
+closeButton.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+closeButton.BorderSizePixel = 1
+closeButton.BorderColor3 = Color3.fromRGB(50, 50, 70)
+closeButton.Font = Enum.Font.Code
+closeButton.Text = "X"
+closeButton.TextSize = 18
+closeButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+closeButton.Parent = topBar
+
+local visualsSearchRow = Instance.new("Frame")
+visualsSearchRow.Name = "SearchRow"
+visualsSearchRow.Size = UDim2.new(1, 0, 0, 40)
+visualsSearchRow.BackgroundTransparency = 1
+visualsSearchRow.LayoutOrder = 1
+visualsSearchRow.Parent = visualsPage
+
+local visualsSearchBox = Instance.new("TextBox")
+visualsSearchBox.Size = UDim2.new(1, 0, 1, 0)
+visualsSearchBox.BackgroundColor3 = Color3.fromRGB(8, 8, 18)
+visualsSearchBox.BorderSizePixel = 1
+visualsSearchBox.BorderColor3 = Color3.fromRGB(35, 35, 70)
+visualsSearchBox.ClearTextOnFocus = false
+visualsSearchBox.Font = Enum.Font.Code
+visualsSearchBox.PlaceholderText = "Search visuals, movement, combat..."
+visualsSearchBox.PlaceholderColor3 = Color3.fromRGB(130, 130, 150)
+visualsSearchBox.Text = ""
+visualsSearchBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+visualsSearchBox.TextSize = 18
+visualsSearchBox.TextXAlignment = Enum.TextXAlignment.Left
+visualsSearchBox.Parent = visualsSearchRow
+
+local visualsSearchPad = Instance.new("UIPadding")
+visualsSearchPad.PaddingLeft = UDim.new(0, 10)
+visualsSearchPad.PaddingRight = UDim.new(0, 10)
+visualsSearchPad.Parent = visualsSearchBox
+
+local sectionRegistry = {}
+local searchableRows = {}
+
+local function createVisualSection(sectionName, layoutOrder)
+	local sectionFrame = Instance.new("Frame")
+	sectionFrame.Name = sectionName .. "Section"
+	sectionFrame.Size = UDim2.new(1, 0, 0, 0)
+	sectionFrame.AutomaticSize = Enum.AutomaticSize.Y
+	sectionFrame.BackgroundColor3 = Color3.fromRGB(6, 6, 14)
+	sectionFrame.BorderSizePixel = 1
+	sectionFrame.BorderColor3 = Color3.fromRGB(25, 25, 55)
+	sectionFrame.LayoutOrder = layoutOrder
+	sectionFrame.Parent = visualsPage
+
+	local sectionList = Instance.new("UIListLayout")
+	sectionList.FillDirection = Enum.FillDirection.Vertical
+	sectionList.SortOrder = Enum.SortOrder.LayoutOrder
+	sectionList.Padding = UDim.new(0, 0)
+	sectionList.Parent = sectionFrame
+
+	local headerButton = Instance.new("TextButton")
+	headerButton.Name = "Header"
+	headerButton.Size = UDim2.new(1, 0, 0, 36)
+	headerButton.BackgroundColor3 = Color3.fromRGB(10, 10, 20)
+	headerButton.BorderSizePixel = 0
+	headerButton.Font = Enum.Font.Code
+	headerButton.TextSize = 18
+	headerButton.TextColor3 = Color3.fromRGB(190, 255, 120)
+	headerButton.TextXAlignment = Enum.TextXAlignment.Left
+	headerButton.AutoButtonColor = false
+	headerButton.LayoutOrder = 1
+	headerButton.Parent = sectionFrame
+
+	local headerPad = Instance.new("UIPadding")
+	headerPad.PaddingLeft = UDim.new(0, 12)
+	headerPad.PaddingRight = UDim.new(0, 12)
+	headerPad.Parent = headerButton
+
+	local contentFrame = Instance.new("Frame")
+	contentFrame.Name = "Content"
+	contentFrame.Size = UDim2.new(1, 0, 0, 0)
+	contentFrame.AutomaticSize = Enum.AutomaticSize.Y
+	contentFrame.BackgroundTransparency = 1
+	contentFrame.LayoutOrder = 2
+	contentFrame.Parent = sectionFrame
+
+	local contentPad = Instance.new("UIPadding")
+	contentPad.PaddingTop = UDim.new(0, 10)
+	contentPad.PaddingBottom = UDim.new(0, 10)
+	contentPad.PaddingLeft = UDim.new(0, 10)
+	contentPad.PaddingRight = UDim.new(0, 10)
+	contentPad.Parent = contentFrame
+
+	local contentList = Instance.new("UIListLayout")
+	contentList.FillDirection = Enum.FillDirection.Vertical
+	contentList.SortOrder = Enum.SortOrder.LayoutOrder
+	contentList.Padding = UDim.new(0, 8)
+	contentList.Parent = contentFrame
+
+	local data = {
+		Name = sectionName,
+		Frame = sectionFrame,
+		Header = headerButton,
+		Content = contentFrame,
+		Collapsed = false,
+	}
+
+	sectionRegistry[sectionName] = data
+	return data
+end
+
+local visualsSection = createVisualSection("Visuals", 2)
+local movementSection = createVisualSection("Movement", 3)
+local combatSection = createVisualSection("Combat", 4)
+
+local function createFeatureRow(parent, layoutOrder, searchTerms)
+	local row = Instance.new("Frame")
+	row.Size = UDim2.new(1, 0, 0, 0)
+	row.AutomaticSize = Enum.AutomaticSize.Y
+	row.BackgroundTransparency = 1
+	row.LayoutOrder = layoutOrder
+	row.Parent = parent
+
+	local rowList = Instance.new("UIListLayout")
+	rowList.FillDirection = Enum.FillDirection.Vertical
+	rowList.SortOrder = Enum.SortOrder.LayoutOrder
+	rowList.Padding = UDim.new(0, 6)
+	rowList.Parent = row
+
+	row:SetAttribute("SearchTerms", string.lower(searchTerms or ""))
+
+	table.insert(searchableRows, row)
+	return row
+end
+
+local function createRowButton(text, parent)
+	local button = Instance.new("TextButton")
+	button.Size = UDim2.new(1, 0, 0, 38)
+	button.BackgroundColor3 = Color3.fromRGB(8, 8, 18)
+	button.BorderSizePixel = 1
+	button.BorderColor3 = Color3.fromRGB(35, 35, 70)
+	button.AutoButtonColor = false
+	button.Font = Enum.Font.Code
+	button.TextSize = 18
+	button.TextColor3 = Color3.fromRGB(230, 230, 230)
+	button.TextXAlignment = Enum.TextXAlignment.Left
+	button.TextTruncate = Enum.TextTruncate.AtEnd
+	button.LayoutOrder = 1
+	button.Parent = parent
+
+	local pad = Instance.new("UIPadding")
+	pad.PaddingLeft = UDim.new(0, 12)
+	pad.PaddingRight = UDim.new(0, 12)
+	pad.Parent = button
+
+	return button
+end
+
+local function createRowValueLabel(text, parent)
+	local label = Instance.new("TextLabel")
+	label.Size = UDim2.new(1, 0, 0, 20)
+	label.BackgroundTransparency = 1
+	label.Font = Enum.Font.Code
+	label.Text = text
+	label.TextSize = 16
+	label.TextColor3 = Color3.fromRGB(180, 180, 200)
+	label.TextXAlignment = Enum.TextXAlignment.Left
+	label.LayoutOrder = 2
+	label.Parent = parent
+	return label
+end
+
+local function createRowSlider(parent, layoutOrder)
+	local slider = Instance.new("Frame")
+	slider.Size = UDim2.new(1, 0, 0, 18)
+	slider.BackgroundColor3 = Color3.fromRGB(8, 8, 18)
+	slider.BorderSizePixel = 1
+	slider.BorderColor3 = Color3.fromRGB(35, 35, 70)
+	slider.LayoutOrder = layoutOrder or 3
+	slider.Parent = parent
+
+	local fill = Instance.new("Frame")
+	fill.Name = "Fill"
+	fill.Size = UDim2.new(0, 0, 1, 0)
+	fill.BackgroundColor3 = Color3.fromRGB(180, 255, 120)
+	fill.BorderSizePixel = 0
+	fill.Parent = slider
+
+	local knob = Instance.new("Frame")
+	knob.Name = "Knob"
+	knob.Size = UDim2.new(0, 10, 0, 24)
+	knob.AnchorPoint = Vector2.new(0.5, 0.5)
+	knob.Position = UDim2.new(0, 0, 0.5, 0)
+	knob.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+	knob.BorderSizePixel = 0
+	knob.Parent = slider
+
+	local knobCorner = Instance.new("UICorner")
+	knobCorner.CornerRadius = UDim.new(0, 4)
+	knobCorner.Parent = knob
+
+	return slider, fill, knob
+end
+
+local highlightRow = createFeatureRow(visualsSection.Content, 1, "highlight visuals esp")
+local highlightButton = createRowButton("Highlight [OFF]", highlightRow)
+
+local nametagRow = createFeatureRow(visualsSection.Content, 2, "name tags nametags visuals labels")
+local nametagButton = createRowButton("Name Tags [ON]", nametagRow)
+
+local teamCheckRow = createFeatureRow(visualsSection.Content, 3, "team check visuals enemy team")
+local teamCheckButton = createRowButton("Team Check [ON]", teamCheckRow)
+
+local speedRow = createFeatureRow(movementSection.Content, 1, "speed movement walk speed run speed")
+local speedButton = createRowButton("Speed [16]", speedRow)
+local speedValueLabel = createRowValueLabel("Walk Speed: 16", speedRow)
+local speedSlider, speedSliderFill, speedSliderKnob = createRowSlider(speedRow, 3)
+
+local flyRow = createFeatureRow(movementSection.Content, 2, "fly movement air")
+local flyButton = createRowButton("Fly [OFF]", flyRow)
+
+local flySpeedRow = createFeatureRow(movementSection.Content, 3, "fly speed movement air speed")
+local flySpeedButton = createRowButton("Fly Speed [65]", flySpeedRow)
+local flySpeedValueLabel = createRowValueLabel("Fly Speed: 65", flySpeedRow)
+local flySpeedSlider, flySpeedSliderFill, flySpeedSliderKnob = createRowSlider(flySpeedRow, 3)
+
+local zombieLockRow = createFeatureRow(combatSection.Content, 1, "zombie lock combat target")
+local zombieLockButton = createRowButton("Zombie Lock [OFF]", zombieLockRow)
+
+local statusRow = createFeatureRow(combatSection.Content, 2, "status controls combat info target")
+local statusBox = Instance.new("TextLabel")
+statusBox.Size = UDim2.new(1, 0, 0, 300)
+statusBox.BackgroundColor3 = Color3.fromRGB(8, 8, 18)
+statusBox.BorderSizePixel = 1
+statusBox.BorderColor3 = Color3.fromRGB(35, 35, 70)
+statusBox.Font = Enum.Font.Code
+statusBox.TextSize = 17
+statusBox.TextColor3 = Color3.fromRGB(180, 180, 200)
+statusBox.TextXAlignment = Enum.TextXAlignment.Left
+statusBox.TextYAlignment = Enum.TextYAlignment.Top
+statusBox.TextWrapped = true
+statusBox.LayoutOrder = 1
+statusBox.Parent = statusRow
+
+local statusPad = Instance.new("UIPadding")
+statusPad.PaddingLeft = UDim.new(0, 12)
+statusPad.PaddingRight = UDim.new(0, 12)
+statusPad.PaddingTop = UDim.new(0, 10)
+statusPad.PaddingBottom = UDim.new(0, 10)
+statusPad.Parent = statusBox
+
+local settingsInfo = Instance.new("TextLabel")
+settingsInfo.BackgroundTransparency = 1
+settingsInfo.Position = UDim2.new(0, 16, 0, 10)
+settingsInfo.Size = UDim2.new(1, -32, 0, 42)
+settingsInfo.Font = Enum.Font.Code
+settingsInfo.Text = "Click an action, then press a key to change the keybind."
+settingsInfo.TextWrapped = true
+settingsInfo.TextSize = 16
+settingsInfo.TextColor3 = Color3.fromRGB(180, 180, 200)
+settingsInfo.TextXAlignment = Enum.TextXAlignment.Left
+settingsInfo.TextYAlignment = Enum.TextYAlignment.Top
+settingsInfo.Parent = settingsPage
+
+local settingsScroll = Instance.new("ScrollingFrame")
+settingsScroll.Name = "SettingsScroll"
+settingsScroll.Position = UDim2.new(0, 16, 0, 64)
+settingsScroll.Size = UDim2.new(1, -32, 1, -80)
+settingsScroll.BackgroundColor3 = Color3.fromRGB(8, 8, 18)
+settingsScroll.BorderSizePixel = 1
+settingsScroll.BorderColor3 = Color3.fromRGB(35, 35, 70)
+settingsScroll.ScrollBarThickness = 8
+settingsScroll.ScrollBarImageColor3 = Color3.fromRGB(180, 255, 120)
+settingsScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+settingsScroll.AutomaticCanvasSize = Enum.AutomaticSize.None
+settingsScroll.ScrollingDirection = Enum.ScrollingDirection.Y
+settingsScroll.Parent = settingsPage
+
+local scrollPad = Instance.new("UIPadding")
+scrollPad.PaddingTop = UDim.new(0, 10)
+scrollPad.PaddingBottom = UDim.new(0, 10)
+scrollPad.PaddingLeft = UDim.new(0, 10)
+scrollPad.PaddingRight = UDim.new(0, 10)
+scrollPad.Parent = settingsScroll
+
+local settingsList = Instance.new("UIListLayout")
+settingsList.FillDirection = Enum.FillDirection.Vertical
+settingsList.SortOrder = Enum.SortOrder.LayoutOrder
+settingsList.Padding = UDim.new(0, 8)
+settingsList.Parent = settingsScroll
+
+local function createScrollButton(parent)
+	local button = Instance.new("TextButton")
+	button.Size = UDim2.new(1, 0, 0, 38)
+	button.BackgroundColor3 = Color3.fromRGB(8, 8, 18)
+	button.BorderSizePixel = 1
+	button.BorderColor3 = Color3.fromRGB(35, 35, 70)
+	button.AutoButtonColor = false
+	button.Font = Enum.Font.Code
+	button.TextSize = 18
+	button.TextColor3 = Color3.fromRGB(230, 230, 230)
+	button.TextXAlignment = Enum.TextXAlignment.Left
+	button.TextTruncate = Enum.TextTruncate.AtEnd
+	button.ClipsDescendants = true
+	button.Parent = parent
+
+	local pad = Instance.new("UIPadding")
+	pad.PaddingLeft = UDim.new(0, 12)
+	pad.PaddingRight = UDim.new(0, 12)
+	pad.Parent = button
+
+	return button
+end
+
+local keybindButtons = {
+	ToggleUI = createScrollButton(settingsScroll),
+	DestroyUI = createScrollButton(settingsScroll),
+	FreeMouse = createScrollButton(settingsScroll),
+	ZombieLock = createScrollButton(settingsScroll),
+	Highlight = createScrollButton(settingsScroll),
+	NameTags = createScrollButton(settingsScroll),
+	TeamCheck = createScrollButton(settingsScroll),
+	Fly = createScrollButton(settingsScroll),
+}
+
+settingsList:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+	settingsScroll.CanvasSize = UDim2.new(0, 0, 0, settingsList.AbsoluteContentSize.Y + 20)
+end)
+
+visualsList:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+	visualsPage.CanvasSize = UDim2.new(0, 0, 0, visualsList.AbsoluteContentSize.Y + 20)
+end)
+
+settingsScroll.CanvasSize = UDim2.new(0, 0, 0, settingsList.AbsoluteContentSize.Y + 20)
+visualsPage.CanvasSize = UDim2.new(0, 0, 0, visualsList.AbsoluteContentSize.Y + 20)
+
+-- LOCK CIRCLE
+local lockCircle = Instance.new("Frame")
+lockCircle.Name = "LockCircle"
+lockCircle.Size = UDim2.new(0, LOCK_RADIUS * 2, 0, LOCK_RADIUS * 2)
+lockCircle.AnchorPoint = Vector2.new(0.5, 0.5)
+lockCircle.Position = UDim2.new(0.5, 0, 0.5, 0)
+lockCircle.BackgroundTransparency = 1
+lockCircle.BorderSizePixel = 0
+lockCircle.Visible = false
+lockCircle.Parent = screenGui
+
+local circleStroke = Instance.new("UIStroke")
+circleStroke.Thickness = 2
+circleStroke.Color = Color3.fromRGB(180, 255, 120)
+circleStroke.Parent = lockCircle
+
+local circleCorner = Instance.new("UICorner")
+circleCorner.CornerRadius = UDim.new(1, 0)
+circleCorner.Parent = lockCircle
+
+local circleCenter = Instance.new("Frame")
+circleCenter.Size = UDim2.new(0, 6, 0, 6)
+circleCenter.AnchorPoint = Vector2.new(0.5, 0.5)
+circleCenter.Position = UDim2.new(0.5, 0, 0.5, 0)
+circleCenter.BackgroundColor3 = Color3.fromRGB(180, 255, 120)
+circleCenter.BorderSizePixel = 0
+circleCenter.Parent = lockCircle
+
+local centerCorner = Instance.new("UICorner")
+centerCorner.CornerRadius = UDim.new(1, 0)
+centerCorner.Parent = circleCenter
+
+local speedDragging = false
+local flySpeedDragging = false
+
+setDescendantZIndex(main, 99999990)
+setDescendantZIndex(loginFrame, 99999991)
+
+applyZIndex(main, {
+	{topBar, 99999992},
+	{title, 99999993},
+	{topHint, 99999993},
+	{tabsBar, 99999992},
+	{tabVisuals, 99999993},
+	{tabSettings, 99999993},
+	{content, 99999990},
+	{visualsPage, 99999990},
+	{settingsPage, 99999990},
+	{settingsScroll, 99999991},
+	{footer, 99999992},
+	{footerText, 99999993},
+	{credits, 99999993},
+	{closeButton, 99999994},
+	{visualsSearchRow, 99999991},
+	{visualsSearchBox, 99999992},
+	{speedSlider, 99999991},
+	{speedSliderFill, 99999992},
+	{speedSliderKnob, 99999993},
+	{flySpeedSlider, 99999991},
+	{flySpeedSliderFill, 99999992},
+	{flySpeedSliderKnob, 99999993},
+	{statusBox, 99999991},
+	{settingsInfo, 99999991},
+})
+
+for _, button in pairs(keybindButtons) do
+	button.ZIndex = 99999991
+end
+
+lockCircle.ZIndex = 99999995
+circleCenter.ZIndex = 99999996
+
+local function makeDraggable(dragHandle, target)
+	local dragging = false
+	local dragStart = nil
+	local startPos = nil
+	local dragInput = nil
+
+	dragHandle.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 then
+			dragging = true
+			dragStart = input.Position
+			startPos = target.Position
+
+			input.Changed:Connect(function()
+				if input.UserInputState == Enum.UserInputState.End then
+					dragging = false
+				end
+			end)
+		end
+	end)
+
+	dragHandle.InputChanged:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseMovement
+			or input.UserInputType == Enum.UserInputType.Touch then
+			dragInput = input
+		end
+	end)
+
+	UserInputService.InputChanged:Connect(function(input)
+		if dragging and input == dragInput then
+			local delta = input.Position - dragStart
+			target.Position = UDim2.new(
+				startPos.X.Scale,
+				startPos.X.Offset + delta.X,
+				startPos.Y.Scale,
+				startPos.Y.Offset + delta.Y
+			)
+		end
+	end)
+end
+
+makeDraggable(topBar, main)
+makeDraggable(loginTop, loginFrame)
+
+local function getLocalTeamValue()
+	if LocalPlayer.Team then
+		return LocalPlayer.Team.Name
+	end
+	return nil
+end
+
+local function normalizeTeamValue(value)
+	if value == nil then
+		return nil
+	end
+
+	local valueType = typeof(value)
+
+	if valueType == "Instance" then
+		return value.Name
+	end
+
+	if valueType == "BrickColor" then
+		return value.Name
+	end
+
+	if valueType == "Color3" then
+		return tostring(value)
+	end
+
+	return tostring(value)
+end
+
+local function getModelTeam(model)
+	if not model or not model:IsA("Model") then
+		return nil
+	end
+
+	local player = Players:GetPlayerFromCharacter(model)
+	if player and player.Team then
+		return normalizeTeamValue(player.Team)
+	end
+
+	for _, attrName in ipairs({
+		"Team",
+		"team",
+		"Faction",
+		"faction",
+		"Side",
+		"side",
+		"Allegiance",
+		"allegiance",
+	}) do
+		local attrValue = model:GetAttribute(attrName)
+		if attrValue ~= nil then
+			return normalizeTeamValue(attrValue)
+		end
+	end
+
+	for _, childName in ipairs({
+		"Team",
+		"team",
+		"Faction",
+		"faction",
+		"Side",
+		"side",
+		"Allegiance",
+		"allegiance",
+	}) do
+		local obj = model:FindFirstChild(childName)
+		if obj then
+			if obj:IsA("ObjectValue") then
+				return normalizeTeamValue(obj.Value)
+			elseif obj:IsA("StringValue") then
+				return normalizeTeamValue(obj.Value)
+			elseif obj:IsA("BrickColorValue") then
+				return normalizeTeamValue(obj.Value)
+			elseif obj:IsA("Color3Value") then
+				return normalizeTeamValue(obj.Value)
+			elseif obj:IsA("IntValue") or obj:IsA("NumberValue") then
+				return tostring(obj.Value)
+			end
+		end
+	end
+
+	local humanoid = model:FindFirstChildOfClass("Humanoid")
+	if humanoid then
+		for _, attrName in ipairs({
+			"Team",
+			"team",
+			"Faction",
+			"faction",
+			"Side",
+			"side",
+			"Allegiance",
+			"allegiance",
+		}) do
+			local attrValue = humanoid:GetAttribute(attrName)
+			if attrValue ~= nil then
+				return normalizeTeamValue(attrValue)
+			end
+		end
+	end
+
+	return nil
+end
+
+local function modelIsEnemy(model)
+	if not model or not model:IsA("Model") then
+		return false
+	end
+
+	local myCharacter = LocalPlayer.Character
+	if myCharacter and model == myCharacter then
+		return false
+	end
+
+	if not teamCheckEnabled then
+		return true
+	end
+
+	local myTeam = getLocalTeamValue()
+	local targetTeam = getModelTeam(model)
+
+	if myTeam and targetTeam and myTeam == targetTeam then
+		return false
+	end
+
+	if myTeam and targetTeam then
+		return myTeam ~= targetTeam
+	end
+
+	local player = Players:GetPlayerFromCharacter(model)
+	if player then
+		return false
+	end
+
+	return false
+end
+
+local function updateCirclePosition()
+	local mousePos = getMouseScreenPosition()
+	lockCircle.Position = UDim2.new(0, mousePos.X, 0, mousePos.Y)
+end
+
+local function getTargetScreenPosition(model)
+	if not model then
+		return nil, false
+	end
+
+	local head = model:FindFirstChild("Head")
+	if not head then
+		return nil, false
+	end
+
+	local screenPoint, onScreen = Camera:WorldToViewportPoint(head.Position)
+	if not onScreen or screenPoint.Z <= 0 then
+		return nil, false
+	end
+
+	return Vector2.new(screenPoint.X, screenPoint.Y), true
+end
+
+local function isTargetInsideLockCircle(model)
+	local screenPos, onScreen = getTargetScreenPosition(model)
+	if not onScreen or not screenPos then
+		return false
+	end
+
+	local mousePos = getMouseScreenPosition()
+	local dist = (screenPos - mousePos).Magnitude
+	return dist <= LOCK_RADIUS
+end
+
+local function isTargetVisible(model)
+	if not model then
+		return false
+	end
+
+	local head = model:FindFirstChild("Head")
+	if not head then
+		return false
+	end
+
+	local origin = Camera.CFrame.Position
+	local direction = head.Position - origin
+
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = {
+		LocalPlayer.Character,
+		model,
+		Camera
+	}
+	params.IgnoreWater = true
+
+	local result = Workspace:Raycast(origin, direction, params)
+
+	if not result then
+		return true
+	end
+
+	return result.Instance and result.Instance:IsDescendantOf(model)
+end
+
+local function isValidZombieTarget(model)
+	if not model or not model:IsA("Model") then
+		return false
+	end
+
+	if model == LocalPlayer.Character then
+		return false
+	end
+
+	local humanoid = model:FindFirstChildOfClass("Humanoid")
+	local head = model:FindFirstChild("Head")
+	local root = model:FindFirstChild("HumanoidRootPart")
+
+	if not humanoid or humanoid.Health <= 0 then
+		return false
+	end
+
+	if not head or not root then
+		return false
+	end
+
+	if not modelIsEnemy(model) then
+		return false
+	end
+
+	return true
+end
+
+local function getTargetWorldDistance(model)
+	local myCharacter = LocalPlayer.Character
+	if not myCharacter then
+		return math.huge
+	end
+
+	local myRoot = myCharacter:FindFirstChild("HumanoidRootPart")
+	local targetRoot = model and model:FindFirstChild("HumanoidRootPart")
+
+	if not myRoot or not targetRoot then
+		return math.huge
+	end
+
+	return (targetRoot.Position - myRoot.Position).Magnitude
+end
+
+local function getBestTargetInCircle()
+	local bestTarget = nil
+	local bestMouseDistance = math.huge
+	local bestWorldDistance = math.huge
+	local mousePos = getMouseScreenPosition()
+
+	for model in pairs(modelCache) do
+		if not model or not model.Parent then
+			modelCache[model] = nil
+		else
+			if isValidZombieTarget(model) then
+				local screenPos, onScreen = getTargetScreenPosition(model)
+				if onScreen and screenPos and isTargetVisible(model) then
+					local mouseDistance = (screenPos - mousePos).Magnitude
+					if mouseDistance <= LOCK_RADIUS then
+						local worldDistance = getTargetWorldDistance(model)
+
+						if mouseDistance < bestMouseDistance
+							or (math.abs(mouseDistance - bestMouseDistance) < 0.001 and worldDistance < bestWorldDistance) then
+							bestMouseDistance = mouseDistance
+							bestWorldDistance = worldDistance
+							bestTarget = model
+						end
+					end
+				end
+			end
+		end
+	end
+
+	return bestTarget
+end
+
+local function removeVisuals(character)
+	if not character then
+		return
+	end
+
+	local hl = character:FindFirstChild("AdminHighlight")
+	if hl then
+		hl:Destroy()
+	end
+
+	local head = character:FindFirstChild("Head")
+	if head then
+		local tag = head:FindFirstChild("AdminNameTag")
+		if tag then
+			tag:Destroy()
+		end
+	end
+end
+
+local function addNameTag(character, player)
+	local head = character:FindFirstChild("Head")
+	if not head then
+		return
+	end
+
+	local old = head:FindFirstChild("AdminNameTag")
+	if old then
+		old:Destroy()
+	end
+
+	if not nametagEnabled then
+		return
+	end
+
+	local billboard = Instance.new("BillboardGui")
+	billboard.Name = "AdminNameTag"
+	billboard.Size = UDim2.new(0, 180, 0, 28)
+	billboard.StudsOffset = Vector3.new(0, 2.8, 0)
+	billboard.AlwaysOnTop = true
+	billboard.MaxDistance = 150
+	billboard.Parent = head
+
+	local label = Instance.new("TextLabel")
+	label.Size = UDim2.new(1, 0, 1, 0)
+	label.BackgroundTransparency = 1
+	label.Font = Enum.Font.Code
+	label.TextScaled = true
+	label.TextStrokeTransparency = 0.5
+	label.TextColor3 = Color3.fromRGB(255, 255, 255)
+	label.Text = player.DisplayName
+	label.Parent = billboard
+end
+
+local function isEnemyPlayer(player)
+	if player == LocalPlayer then
+		return false
+	end
+
+	if not teamCheckEnabled then
+		return true
+	end
+
+	if not LocalPlayer.Team or not player.Team then
+		return false
+	end
+
+	return LocalPlayer.Team ~= player.Team
+end
+
+local function setVisuals(player)
+	local character = player.Character
+	if not character then
+		return
+	end
+
+	removeVisuals(character)
+
+	if not isEnemyPlayer(player) then
+		return
+	end
+
+	if highlightEnabled then
+		local hl = Instance.new("Highlight")
+		hl.Name = "AdminHighlight"
+		hl.FillColor = Color3.fromRGB(80, 170, 255)
+		hl.OutlineColor = Color3.fromRGB(255, 255, 255)
+		hl.FillTransparency = 0.6
+		hl.OutlineTransparency = 0
+		hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+		hl.Parent = character
+	end
+
+	if nametagEnabled then
+		addNameTag(character, player)
+	end
+end
+
+local function updateAllPlayers()
+	for _, player in ipairs(Players:GetPlayers()) do
+		if player ~= LocalPlayer then
+			local character = player.Character
+			if character then
+				removeVisuals(character)
+			end
+			setVisuals(player)
+		end
+	end
+end
+
+local function refreshCircleColor()
+	if zombieLockEnabled and currentZombieTarget then
+		circleStroke.Color = Color3.fromRGB(255, 120, 120)
+		circleCenter.BackgroundColor3 = Color3.fromRGB(255, 120, 120)
+	else
+		circleStroke.Color = Color3.fromRGB(180, 255, 120)
+		circleCenter.BackgroundColor3 = Color3.fromRGB(180, 255, 120)
+	end
+end
+
+local function updateSectionHeaders()
+	for _, data in pairs(sectionRegistry) do
+		data.Header.Text = string.format("%s %s", data.Collapsed and "[+]" or "[-]", data.Name)
+	end
+end
+
+local function updateSpeedUI()
+	local alpha = (currentWalkSpeed - MIN_SPEED) / (MAX_SPEED - MIN_SPEED)
+	speedSliderFill.Size = UDim2.new(alpha, 0, 1, 0)
+	speedSliderKnob.Position = UDim2.new(alpha, 0, 0.5, 0)
+	speedButton.Text = "Speed [" .. tostring(currentWalkSpeed) .. "]"
+	speedValueLabel.Text = "Walk Speed: " .. tostring(currentWalkSpeed)
+end
+
+local function updateFlySpeedUI()
+	local alpha = (currentFlySpeed - MIN_FLY_SPEED) / (MAX_FLY_SPEED - MIN_FLY_SPEED)
+	flySpeedSliderFill.Size = UDim2.new(alpha, 0, 1, 0)
+	flySpeedSliderKnob.Position = UDim2.new(alpha, 0, 0.5, 0)
+	flySpeedButton.Text = "Fly Speed [" .. tostring(currentFlySpeed) .. "]"
+	flySpeedValueLabel.Text = "Fly Speed: " .. tostring(currentFlySpeed)
+end
+
+local function setWalkSpeedFromAlpha(alpha)
+	alpha = math.clamp(alpha, 0, 1)
+	local value = MIN_SPEED + ((MAX_SPEED - MIN_SPEED) * alpha)
+	currentWalkSpeed = clampWalkSpeed(value)
+	applyWalkSpeed()
+	updateSpeedUI()
+	if updateStatusText then
+		updateStatusText()
+	end
+end
+
+local function setFlySpeedFromAlpha(alpha)
+	alpha = math.clamp(alpha, 0, 1)
+	local value = MIN_FLY_SPEED + ((MAX_FLY_SPEED - MIN_FLY_SPEED) * alpha)
+	currentFlySpeed = clampFlySpeed(value)
+	updateFlySpeedUI()
+	if updateStatusText then
+		updateStatusText()
+	end
+end
+
+local function updateSpeedFromInput(input)
+	local sliderAbsPos = speedSlider.AbsolutePosition
+	local sliderAbsSize = speedSlider.AbsoluteSize
+	local alpha = (input.Position.X - sliderAbsPos.X) / sliderAbsSize.X
+	setWalkSpeedFromAlpha(alpha)
+end
+
+local function updateFlySpeedFromInput(input)
+	local sliderAbsPos = flySpeedSlider.AbsolutePosition
+	local sliderAbsSize = flySpeedSlider.AbsoluteSize
+	local alpha = (input.Position.X - sliderAbsPos.X) / sliderAbsSize.X
+	setFlySpeedFromAlpha(alpha)
+end
+
+local function updateSettingsButtons()
+	keybindButtons.ToggleUI.Text = ((waitingForKeybind == "ToggleUI") and "> " or "") .. "Toggle UI [" .. keyCodeToText(Keybinds.ToggleUI) .. "]"
+	keybindButtons.DestroyUI.Text = ((waitingForKeybind == "DestroyUI") and "> " or "") .. "Destroy UI [" .. keyCodeToText(Keybinds.DestroyUI) .. "]"
+	keybindButtons.FreeMouse.Text = ((waitingForKeybind == "FreeMouse") and "> " or "") .. "Free Mouse [" .. keyCodeToText(Keybinds.FreeMouse) .. "]"
+	keybindButtons.ZombieLock.Text = ((waitingForKeybind == "ZombieLock") and "> " or "") .. "Zombie Lock [" .. keyCodeToText(Keybinds.ZombieLock) .. "]"
+	keybindButtons.Highlight.Text = ((waitingForKeybind == "Highlight") and "> " or "") .. "Highlight [" .. keyCodeToText(Keybinds.Highlight) .. "]"
+	keybindButtons.NameTags.Text = ((waitingForKeybind == "NameTags") and "> " or "") .. "Name Tags [" .. keyCodeToText(Keybinds.NameTags) .. "]"
+	keybindButtons.TeamCheck.Text = ((waitingForKeybind == "TeamCheck") and "> " or "") .. "Team Check [" .. keyCodeToText(Keybinds.TeamCheck) .. "]"
+	keybindButtons.Fly.Text = ((waitingForKeybind == "Fly") and "> " or "") .. "Fly [" .. keyCodeToText(Keybinds.Fly) .. "]"
+end
+
+updateStatusText = function()
+	local targetName = "none"
+	if currentZombieTarget and currentZombieTarget.Parent then
+		targetName = currentZombieTarget.Name
+	end
+
+	local waitingText = waitingForKeybind and ("\nWaiting for keybind: " .. waitingForKeybind) or ""
+
+	statusBox.Text =
+		"Debug UI for your own game.\n\n" ..
+		"Current target: " .. targetName .. "\n" ..
+		"Lock circle follows your mouse.\n" ..
+		"Target = closest enemy to your mouse inside the circle.\n" ..
+		"Target must be visible and have line of sight.\n" ..
+		"Target must have valid enemy team data when Team Check is enabled.\n\n" ..
+		"Visual toggles:\n" ..
+		"- Highlight = " .. (highlightEnabled and "ON" or "OFF") .. "\n" ..
+		"- Name Tags = " .. (nametagEnabled and "ON" or "OFF") .. "\n" ..
+		"- Team Check = " .. (teamCheckEnabled and "ON" or "OFF") .. "\n" ..
+		"- Zombie Lock = " .. (zombieLockEnabled and "ON" or "OFF") .. "\n" ..
+		"- Fly = " .. (flyEnabled and "ON" or "OFF") .. "\n" ..
+		"- Walk Speed = " .. tostring(currentWalkSpeed) .. "\n" ..
+		"- Fly Speed = " .. tostring(currentFlySpeed) .. "\n\n" ..
+		"Controls:\n" ..
+		"- " .. keyCodeToText(Keybinds.ToggleUI) .. " = toggle UI\n" ..
+		"- " .. keyCodeToText(Keybinds.DestroyUI) .. " = destroy UI\n" ..
+		"- " .. keyCodeToText(Keybinds.FreeMouse) .. " = free mouse\n" ..
+		"- " .. keyCodeToText(Keybinds.ZombieLock) .. " = zombie lock\n" ..
+		"- " .. keyCodeToText(Keybinds.Highlight) .. " = toggle highlight\n" ..
+		"- " .. keyCodeToText(Keybinds.NameTags) .. " = toggle name tags\n" ..
+		"- " .. keyCodeToText(Keybinds.TeamCheck) .. " = toggle team check\n" ..
+		"- " .. keyCodeToText(Keybinds.Fly) .. " = toggle fly\n" ..
+		"- W/A/S/D = fly move\n" ..
+		"- Space = fly up\n" ..
+		"- LeftControl = fly down" ..
+		waitingText
+end
+
+updateDynamicTexts = function()
+	topHint.Text =
+		string.format(
+			"[%s] Toggle  [%s] Close  [%s] Mouse",
+			keyCodeToText(Keybinds.ToggleUI),
+			keyCodeToText(Keybinds.DestroyUI),
+			keyCodeToText(Keybinds.FreeMouse)
+		)
+
+	footerText.Text =
+		string.format(
+			"[%s] UI   [%s] Destroy   [%s] Mouse   [%s] Lock   [%s] HL   [%s] Tags   [%s] Team   [%s] Fly",
+			keyCodeToText(Keybinds.ToggleUI),
+			keyCodeToText(Keybinds.DestroyUI),
+			keyCodeToText(Keybinds.FreeMouse),
+			keyCodeToText(Keybinds.ZombieLock),
+			keyCodeToText(Keybinds.Highlight),
+			keyCodeToText(Keybinds.NameTags),
+			keyCodeToText(Keybinds.TeamCheck),
+			keyCodeToText(Keybinds.Fly)
+		)
+
+	highlightButton.Text = "Highlight [" .. (highlightEnabled and "ON" or "OFF") .. "] <" .. keyCodeToText(Keybinds.Highlight) .. ">"
+	nametagButton.Text = "Name Tags [" .. (nametagEnabled and "ON" or "OFF") .. "] <" .. keyCodeToText(Keybinds.NameTags) .. ">"
+	teamCheckButton.Text = "Team Check [" .. (teamCheckEnabled and "ON" or "OFF") .. "] <" .. keyCodeToText(Keybinds.TeamCheck) .. ">"
+	zombieLockButton.Text = "Zombie Lock [" .. (zombieLockEnabled and "ON" or "OFF") .. "] <" .. keyCodeToText(Keybinds.ZombieLock) .. ">"
+	flyButton.Text = "Fly [" .. (flyEnabled and "ON" or "OFF") .. "] <" .. keyCodeToText(Keybinds.Fly) .. ">"
+
+	updateSectionHeaders()
+	updateSettingsButtons()
+	refreshCircleColor()
+	updateSpeedUI()
+	updateFlySpeedUI()
+
+	if applyVisualsFilter then
+		applyVisualsFilter()
+	end
+end
+
+applyVisualsFilter = function()
+	local query = string.lower(visualsSearchBox.Text or "")
+	local hasQuery = query ~= ""
+
+	for _, row in ipairs(searchableRows) do
+		local terms = row:GetAttribute("SearchTerms") or ""
+		row.Visible = (not hasQuery) or string.find(terms, query, 1, true) ~= nil
+	end
+
+	for _, data in pairs(sectionRegistry) do
+		local hasVisibleRow = false
+		for _, child in ipairs(data.Content:GetChildren()) do
+			if child:IsA("Frame") and child.Visible then
+				hasVisibleRow = true
+				break
+			end
+		end
+
+		local sectionMatch = hasQuery and string.find(string.lower(data.Name), query, 1, true) ~= nil
+		local sectionVisible = (not hasQuery) or hasVisibleRow or sectionMatch
+
+		data.Frame.Visible = sectionVisible
+		data.Content.Visible = sectionVisible and (not data.Collapsed)
+	end
+
+	visualsPage.CanvasPosition = Vector2.new(0, 0)
+	visualsPage.CanvasSize = UDim2.new(0, 0, 0, visualsList.AbsoluteContentSize.Y + 20)
+end
+
+for _, data in pairs(sectionRegistry) do
+	data.Header.MouseButton1Click:Connect(function()
+		data.Collapsed = not data.Collapsed
+		data.Content.Visible = not data.Collapsed
+		updateSectionHeaders()
+		if applyVisualsFilter then
+			applyVisualsFilter()
+		end
+	end)
+end
+
+visualsSearchBox:GetPropertyChangedSignal("Text"):Connect(function()
+	if applyVisualsFilter then
+		applyVisualsFilter()
+	end
+end)
+
+local function animateTabButton(button, selected)
+	local goalBg = selected and Color3.fromRGB(16, 20, 30) or Color3.fromRGB(8, 8, 18)
+	local goalText = selected and Color3.fromRGB(190, 255, 120) or Color3.fromRGB(200, 200, 200)
+
+	TweenService:Create(button, TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+		BackgroundColor3 = goalBg,
+		TextColor3 = goalText
+	}):Play()
+end
+
+local function switchTab(tabName)
+	if tabAnimating or activeTab == tabName then
+		return
+	end
+
+	tabAnimating = true
+
+	local oldPage = activeTab == "Visuals" and visualsPage or settingsPage
+	local newPage = tabName == "Visuals" and visualsPage or settingsPage
+	local moveLeft = tabName == "Settings"
+
+	newPage.Visible = true
+	newPage.Position = moveLeft and UDim2.new(1, 0, 0, 0) or UDim2.new(-1, 0, 0, 0)
+
+	local tweenOut = TweenService:Create(
+		oldPage,
+		TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+		{Position = moveLeft and UDim2.new(-1, 0, 0, 0) or UDim2.new(1, 0, 0, 0)}
+	)
+
+	local tweenIn = TweenService:Create(
+		newPage,
+		TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+		{Position = UDim2.new(0, 0, 0, 0)}
+	)
+
+	animateTabButton(tabVisuals, tabName == "Visuals")
+	animateTabButton(tabSettings, tabName == "Settings")
+
+	tweenOut:Play()
+	tweenIn:Play()
+
+	tweenIn.Completed:Connect(function()
+		oldPage.Visible = false
+		oldPage.Position = UDim2.new(0, 0, 0, 0)
+		activeTab = tabName
+		tabAnimating = false
+	end)
+end
+
+local function stopZombieLock()
+	zombieLockEnabled = false
+	currentZombieTarget = nil
+	lockCircle.Visible = false
+
+	if zombieLockConnection then
+		zombieLockConnection:Disconnect()
+		zombieLockConnection = nil
+	end
+
+	updateDynamicTexts()
+	updateStatusText()
+end
+
+local function startZombieLock()
+	if zombieLockConnection then
+		zombieLockConnection:Disconnect()
+		zombieLockConnection = nil
+	end
+
+	zombieLockEnabled = true
+	currentZombieTarget = nil
+	lockCircle.Visible = true
+	lastTargetScan = 0
+
+	zombieLockConnection = RunService.RenderStepped:Connect(function()
+		if not zombieLockEnabled then
+			return
+		end
+
+		local myCharacter = LocalPlayer.Character
+		local myHumanoid = myCharacter and myCharacter:FindFirstChildOfClass("Humanoid")
+		local myRoot = myCharacter and myCharacter:FindFirstChild("HumanoidRootPart")
+
+		if not myCharacter or not myHumanoid or myHumanoid.Health <= 0 or not myRoot then
+			currentZombieTarget = nil
+			updateDynamicTexts()
+			updateStatusText()
+			return
+		end
+
+		updateCirclePosition()
+
+		local now = tick()
+		if now - lastTargetScan >= TARGET_SCAN_INTERVAL then
+			lastTargetScan = now
+
+			local bestTarget = getBestTargetInCircle()
+			if bestTarget ~= currentZombieTarget then
+				currentZombieTarget = bestTarget
+				updateDynamicTexts()
+				updateStatusText()
+			end
+		end
+
+		if currentZombieTarget then
+			if not currentZombieTarget.Parent
+				or not isValidZombieTarget(currentZombieTarget)
+				or not isTargetVisible(currentZombieTarget)
+				or not isTargetInsideLockCircle(currentZombieTarget) then
+				currentZombieTarget = nil
+				updateDynamicTexts()
+				updateStatusText()
+				return
+			end
+
+			local head = currentZombieTarget:FindFirstChild("Head")
+			if head then
+				local camPos = Camera.CFrame.Position
+				Camera.CFrame = CFrame.new(camPos, head.Position)
+			else
+				currentZombieTarget = nil
+				updateDynamicTexts()
+				updateStatusText()
+			end
+		end
+	end)
+
+	updateCirclePosition()
+	updateDynamicTexts()
+	updateStatusText()
+end
+
+local function destroyUI()
+	stopZombieLock()
+	stopFlyController()
+	stopSpeedEnforcement()
+	screenGui:Destroy()
+end
+
+local function setKeybind(actionName, keyCode)
+	Keybinds[actionName] = keyCode
+	updateDynamicTexts()
+	updateStatusText()
+end
+
+local function toggleHighlight()
+	highlightEnabled = not highlightEnabled
+	updateDynamicTexts()
+	updateAllPlayers()
+	updateStatusText()
+end
+
+local function toggleNameTags()
+	nametagEnabled = not nametagEnabled
+	updateDynamicTexts()
+	updateAllPlayers()
+	updateStatusText()
+end
+
+local function toggleTeamCheck()
+	teamCheckEnabled = not teamCheckEnabled
+	currentZombieTarget = nil
+	updateDynamicTexts()
+	updateStatusText()
+	updateAllPlayers()
+end
+
+local function toggleZombieLock()
+	if zombieLockEnabled then
+		stopZombieLock()
+	else
+		startZombieLock()
+	end
+end
+
+local function fullRefreshAfterRespawn()
+	currentZombieTarget = nil
+
+	if zombieLockEnabled then
+		stopZombieLock()
+	end
+
+	stopFlyController()
+	rebuildModelCache()
+
+	task.wait(0.25)
+	updateAllPlayers()
+	applyWalkSpeed()
+
+	if flyEnabled then
+		startFlyController()
+	end
+
+	updateDynamicTexts()
+	updateStatusText()
+end
+
+highlightButton.MouseButton1Click:Connect(toggleHighlight)
+nametagButton.MouseButton1Click:Connect(toggleNameTags)
+teamCheckButton.MouseButton1Click:Connect(toggleTeamCheck)
+zombieLockButton.MouseButton1Click:Connect(toggleZombieLock)
+flyButton.MouseButton1Click:Connect(toggleFly)
+
+speedButton.MouseButton1Click:Connect(function()
+	currentWalkSpeed = 16
+	applyWalkSpeed()
+	updateSpeedUI()
+	updateStatusText()
+end)
+
+flySpeedButton.MouseButton1Click:Connect(function()
+	currentFlySpeed = 65
+	updateFlySpeedUI()
+	updateStatusText()
+end)
+
+speedSlider.InputBegan:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 then
+		speedDragging = true
+		updateSpeedFromInput(input)
+	end
+end)
+
+speedSliderKnob.InputBegan:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 then
+		speedDragging = true
+		updateSpeedFromInput(input)
+	end
+end)
+
+flySpeedSlider.InputBegan:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 then
+		flySpeedDragging = true
+		updateFlySpeedFromInput(input)
+	end
+end)
+
+flySpeedSliderKnob.InputBegan:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 then
+		flySpeedDragging = true
+		updateFlySpeedFromInput(input)
+	end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+	if speedDragging and input.UserInputType == Enum.UserInputType.MouseMovement then
+		updateSpeedFromInput(input)
+	end
+
+	if flySpeedDragging and input.UserInputType == Enum.UserInputType.MouseMovement then
+		updateFlySpeedFromInput(input)
+	end
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 then
+		speedDragging = false
+		flySpeedDragging = false
+	end
+
+	if input.UserInputType ~= Enum.UserInputType.Keyboard then
+		return
+	end
+
+	if input.KeyCode == Enum.KeyCode.W then
+		flyControls.Forward = false
+	elseif input.KeyCode == Enum.KeyCode.S then
+		flyControls.Backward = false
+	elseif input.KeyCode == Enum.KeyCode.A then
+		flyControls.Left = false
+	elseif input.KeyCode == Enum.KeyCode.D then
+		flyControls.Right = false
+	elseif input.KeyCode == Enum.KeyCode.Space then
+		flyControls.Up = false
+	elseif input.KeyCode == Enum.KeyCode.LeftControl then
+		flyControls.Down = false
+	end
+end)
+
+keybindButtons.ToggleUI.MouseButton1Click:Connect(function()
+	waitingForKeybind = "ToggleUI"
+	updateDynamicTexts()
+	updateStatusText()
+end)
+
+keybindButtons.DestroyUI.MouseButton1Click:Connect(function()
+	waitingForKeybind = "DestroyUI"
+	updateDynamicTexts()
+	updateStatusText()
+end)
+
+keybindButtons.FreeMouse.MouseButton1Click:Connect(function()
+	waitingForKeybind = "FreeMouse"
+	updateDynamicTexts()
+	updateStatusText()
+end)
+
+keybindButtons.ZombieLock.MouseButton1Click:Connect(function()
+	waitingForKeybind = "ZombieLock"
+	updateDynamicTexts()
+	updateStatusText()
+end)
+
+keybindButtons.Highlight.MouseButton1Click:Connect(function()
+	waitingForKeybind = "Highlight"
+	updateDynamicTexts()
+	updateStatusText()
+end)
+
+keybindButtons.NameTags.MouseButton1Click:Connect(function()
+	waitingForKeybind = "NameTags"
+	updateDynamicTexts()
+	updateStatusText()
+end)
+
+keybindButtons.TeamCheck.MouseButton1Click:Connect(function()
+	waitingForKeybind = "TeamCheck"
+	updateDynamicTexts()
+	updateStatusText()
+end)
+
+keybindButtons.Fly.MouseButton1Click:Connect(function()
+	waitingForKeybind = "Fly"
+	updateDynamicTexts()
+	updateStatusText()
+end)
+
+tabVisuals.MouseButton1Click:Connect(function()
+	switchTab("Visuals")
+end)
+
+tabSettings.MouseButton1Click:Connect(function()
+	switchTab("Settings")
+end)
+
+closeButton.MouseButton1Click:Connect(function()
+	destroyUI()
+end)
+
+local function unlockMainUI()
+	unlocked = true
+	loginFrame.Visible = false
+	main.Visible = true
+	codeBox:ReleaseFocus()
+	applyWalkSpeed()
+	startSpeedEnforcement()
+	updateDynamicTexts()
+	updateStatusText()
+	updateAllPlayers()
+
+	if flyEnabled then
+		startFlyController()
+	end
+end
+
+local function tryUnlock()
+	if codeBox.Text == ACCESS_CODE then
+		statusLabel.TextColor3 = Color3.fromRGB(120, 255, 120)
+		statusLabel.Text = "Access granted."
+		unlockMainUI()
+	else
+		statusLabel.TextColor3 = Color3.fromRGB(255, 120, 120)
+		statusLabel.Text = "Wrong code."
+	end
+end
+
+submitButton.MouseButton1Click:Connect(function()
+	tryUnlock()
+end)
+
+codeBox.FocusLost:Connect(function(enterPressed)
+	if enterPressed then
+		tryUnlock()
+	end
+end)
+
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if gameProcessed then
+		return
+	end
+
+	if input.UserInputType ~= Enum.UserInputType.Keyboard then
+		return
+	end
+
+	if waitingForKeybind then
+		setKeybind(waitingForKeybind, input.KeyCode)
+		waitingForKeybind = nil
+		updateDynamicTexts()
+		updateStatusText()
+		return
+	end
+
+	if input.KeyCode == Enum.KeyCode.W then
+		flyControls.Forward = true
+	elseif input.KeyCode == Enum.KeyCode.S then
+		flyControls.Backward = true
+	elseif input.KeyCode == Enum.KeyCode.A then
+		flyControls.Left = true
+	elseif input.KeyCode == Enum.KeyCode.D then
+		flyControls.Right = true
+	elseif input.KeyCode == Enum.KeyCode.Space then
+		flyControls.Up = true
+	elseif input.KeyCode == Enum.KeyCode.LeftControl then
+		flyControls.Down = true
+	end
+
+	if input.KeyCode == Keybinds.ToggleUI and unlocked then
+		uiOpen = not uiOpen
+		main.Visible = uiOpen
+	end
+
+	if input.KeyCode == Keybinds.DestroyUI then
+		destroyUI()
+	end
+
+	if input.KeyCode == Keybinds.FreeMouse then
+		UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+		UserInputService.MouseIconEnabled = true
+	end
+
+	if input.KeyCode == Keybinds.ZombieLock and unlocked then
+		toggleZombieLock()
+	end
+
+	if input.KeyCode == Keybinds.Highlight and unlocked then
+		toggleHighlight()
+	end
+
+	if input.KeyCode == Keybinds.NameTags and unlocked then
+		toggleNameTags()
+	end
+
+	if input.KeyCode == Keybinds.TeamCheck and unlocked then
+		toggleTeamCheck()
+	end
+
+	if input.KeyCode == Keybinds.Fly and unlocked then
+		toggleFly()
+	end
+end)
+
+local function hookPlayer(player)
+	player.CharacterAdded:Connect(function(character)
+		task.wait(1)
+		if unlocked then
+			removeVisuals(character)
+			rebuildModelCache()
+			updateAllPlayers()
+			updateStatusText()
+		end
+	end)
+
+	player.CharacterRemoving:Connect(function(character)
+		removeVisuals(character)
+		if currentZombieTarget == character then
+			currentZombieTarget = nil
+			updateStatusText()
+		end
+	end)
+
+	player:GetPropertyChangedSignal("Team"):Connect(function()
+		if unlocked then
+			currentZombieTarget = nil
+			updateAllPlayers()
+			updateStatusText()
+		end
+	end)
+end
+
+local function hookLocalCharacter(character)
+	currentZombieTarget = nil
+	stopFlyController()
+
+	task.defer(function()
+		local humanoid = character:FindFirstChildOfClass("Humanoid")
+		if humanoid then
+			humanoid.Died:Connect(function()
+				currentZombieTarget = nil
+				stopFlyController()
+
+				if zombieLockEnabled then
+					stopZombieLock()
+				end
+			end)
+		end
+	end)
+
+	task.spawn(function()
+		task.wait(1)
+		if unlocked then
+			fullRefreshAfterRespawn()
+			applyWalkSpeed()
+		end
+	end)
+end
+
+for _, player in ipairs(Players:GetPlayers()) do
+	if player ~= LocalPlayer then
+		hookPlayer(player)
+	end
+end
+
+Players.PlayerAdded:Connect(function(player)
+	if player ~= LocalPlayer then
+		hookPlayer(player)
+	end
+end)
+
+if LocalPlayer.Character then
+	hookLocalCharacter(LocalPlayer.Character)
+end
+
+LocalPlayer.CharacterAdded:Connect(function(character)
+	hookLocalCharacter(character)
+end)
+
+LocalPlayer.CharacterRemoving:Connect(function()
+	stopFlyController()
+	currentZombieTarget = nil
+end)
+
+LocalPlayer:GetPropertyChangedSignal("Team"):Connect(function()
+	if unlocked then
+		currentZombieTarget = nil
+		rebuildModelCache()
+		updateAllPlayers()
+		updateStatusText()
+	end
+end)
+
+RunService.RenderStepped:Connect(function()
+	if zombieLockEnabled then
+		updateCirclePosition()
+	end
+end)
+
+settingsPage.Visible = false
+settingsPage.Position = UDim2.new(1, 0, 0, 0)
+visualsPage.Visible = true
+visualsPage.Position = UDim2.new(0, 0, 0, 0)
+activeTab = "Visuals"
+
+updateSectionHeaders()
+applyVisualsFilter()
+animateTabButton(tabVisuals, true)
+animateTabButton(tabSettings, false)
+updateDynamicTexts()
+updateStatusText()
+updateSpeedUI()
+updateFlySpeedUI()
+codeBox:CaptureFocus()
